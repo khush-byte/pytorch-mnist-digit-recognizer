@@ -1,0 +1,28 @@
+# Virtual environment
+.venv/
+venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.vscode/
+.idea/
+
+# MNIST downloaded dataset
+data/
+
+# Temporary/debug files
+last_input.png
+
+# User corrections
+corrections/
+
+# User-specific retrained model
+mnist_model_user.pth
+
+# Windows
+Thumbs.db
+Desktop.ini
