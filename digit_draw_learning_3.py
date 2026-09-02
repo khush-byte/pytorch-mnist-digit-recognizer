@@ -6,7 +6,7 @@ from tkinter import messagebox
 
 import torch
 from torch import nn
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 from torchvision import datasets, transforms
 from torchvision.transforms import ToTensor
 
@@ -32,9 +32,18 @@ BASE_MODEL_FILE = "mnist_cnn_model.pth"
 USER_MODEL_FILE = "mnist_cnn_user.pth"
 
 CORRECTIONS_DIR = "corrections"
+TEST_DATASET_DIR = "user_test_dataset"
+TEST_REPORT_FILE = "user_handwriting_evaluation.txt"
+TEST_ERRORS_IMAGE_FILE = "user_handwriting_errors.png"
+TARGET_TEST_SAMPLES_PER_DIGIT = 20
 
 os.makedirs(
     CORRECTIONS_DIR,
+    exist_ok=True
+)
+
+os.makedirs(
+    TEST_DATASET_DIR,
     exist_ok=True
 )
 
@@ -216,7 +225,7 @@ CANVAS_SIZE = max(
 )
 
 # Тонкая кисть.
-BRUSH_SIZE = 13
+BRUSH_SIZE = 14
 
 
 # ============================================================
@@ -268,6 +277,30 @@ def count_corrections():
     return total
 
 
+def get_test_sample_counts():
+
+    counts = {}
+
+    for digit in range(10):
+
+        directory = os.path.join(
+            TEST_DATASET_DIR,
+            str(digit)
+        )
+
+        if not os.path.isdir(directory):
+            counts[digit] = 0
+            continue
+
+        counts[digit] = sum(
+            1
+            for name in os.listdir(directory)
+            if name.lower().endswith(".png")
+        )
+
+    return counts
+
+
 def update_model_info():
 
     corrections = count_corrections()
@@ -283,6 +316,20 @@ def update_model_info():
     )
 
 
+def update_test_info():
+
+    counts = get_test_sample_counts()
+
+    text = "   ".join(
+        f"{digit}: {counts[digit]}/{TARGET_TEST_SAMPLES_PER_DIGIT}"
+        for digit in range(10)
+    )
+
+    test_counts_label.config(
+        text=text
+    )
+
+
 def set_training_controls(enabled):
 
     state = tk.NORMAL if enabled else tk.DISABLED
@@ -293,6 +340,10 @@ def set_training_controls(enabled):
     train_all_button.config(state=state)
     reset_model_button.config(state=state)
     correct_digit_entry.config(state=state)
+    save_test_button.config(state=state)
+    evaluate_test_button.config(state=state)
+    open_errors_button.config(state=state)
+    test_digit_entry.config(state=state)
 
 
 def format_probabilities(probabilities):
@@ -1348,7 +1399,828 @@ def reset_user_model():
 
 
 # ============================================================
-# 17. ОЧИСТКА ПОЛЯ
+# 17. НЕЗАВИСИМЫЙ ТЕСТОВЫЙ НАБОР ПОЛЬЗОВАТЕЛЯ
+#
+# Эти изображения никогда не используются для обучения.
+# Они нужны только для честной проверки модели на реальном почерке.
+# ============================================================
+
+def save_test_sample():
+
+    value = (
+        test_digit_var
+        .get()
+        .strip()
+    )
+
+    if (
+        len(value) != 1
+        or not value.isdigit()
+    ):
+
+        test_status.config(
+            text="Укажите правильную цифру от 0 до 9."
+        )
+
+        return
+
+    digit = int(value)
+
+    mnist_image = prepare_image()
+
+    if mnist_image is None:
+
+        test_status.config(
+            text="Сначала нарисуйте цифру."
+        )
+
+        return
+
+    directory = os.path.join(
+        TEST_DATASET_DIR,
+        str(digit)
+    )
+
+    os.makedirs(
+        directory,
+        exist_ok=True
+    )
+
+    timestamp = datetime.now().strftime(
+        "%Y%m%d_%H%M%S_%f"
+    )
+
+    path = os.path.join(
+        directory,
+        f"{timestamp}.png"
+    )
+
+    mnist_image.save(path)
+
+    counts = get_test_sample_counts()
+    saved_count = counts[digit]
+
+    # Очищаем поле, но сохраняем выбранную тестовую метку.
+    clear()
+    test_digit_var.set(str(digit))
+    update_test_info()
+
+    test_status.config(
+        text=(
+            f"✓ Цифра {digit} сохранена только для теста: "
+            f"{saved_count}/{TARGET_TEST_SAMPLES_PER_DIGIT}. "
+            "Нарисуйте следующий вариант."
+        )
+    )
+
+    print(
+        "Тестовый пример сохранён:",
+        path
+    )
+
+
+def load_user_test_samples():
+
+    samples = []
+
+    for digit in range(10):
+
+        directory = os.path.join(
+            TEST_DATASET_DIR,
+            str(digit)
+        )
+
+        if not os.path.isdir(directory):
+            continue
+
+        for filename in sorted(
+            os.listdir(directory)
+        ):
+
+            if not filename.lower().endswith(".png"):
+                continue
+
+            samples.append(
+                (
+                    os.path.join(directory, filename),
+                    digit
+                )
+            )
+
+    return samples
+
+
+def evaluate_model_on_user_samples(
+    model_file,
+    samples
+):
+
+    evaluation_model = CNN().to(device)
+
+    state = torch.load(
+        model_file,
+        map_location=device,
+        weights_only=True
+    )
+
+    evaluation_model.load_state_dict(state)
+    evaluation_model.eval()
+
+    confusion = torch.zeros(
+        (10, 10),
+        dtype=torch.int64
+    )
+
+    error_details = []
+
+    correct = 0
+    total = 0
+    batch_size = 128
+
+    with torch.inference_mode():
+
+        for start in range(
+            0,
+            len(samples),
+            batch_size
+        ):
+
+            batch_samples = samples[
+                start:start + batch_size
+            ]
+
+            images = []
+            labels = []
+
+            for path, digit in batch_samples:
+
+                with Image.open(path) as opened:
+
+                    sample_image = (
+                        opened
+                        .convert("L")
+                        .copy()
+                    )
+
+                images.append(
+                    ToTensor()(sample_image)
+                )
+
+                labels.append(digit)
+
+            images_batch = torch.stack(images).to(device)
+
+            labels_cpu = torch.tensor(
+                labels,
+                dtype=torch.long
+            )
+
+            labels_device = labels_cpu.to(device)
+
+            logits = evaluation_model(images_batch)
+
+            probabilities = torch.softmax(
+                logits,
+                dim=1
+            )
+
+            predictions = probabilities.argmax(dim=1)
+
+            predicted_confidences = probabilities.gather(
+                1,
+                predictions.unsqueeze(1)
+            ).squeeze(1)
+
+            correct += (
+                predictions == labels_device
+            ).sum().item()
+
+            total += len(labels)
+
+            pairs = (
+                labels_cpu * 10
+                + predictions.cpu()
+            )
+
+            confusion += torch.bincount(
+                pairs,
+                minlength=100
+            ).reshape(10, 10)
+
+            for index, (path, correct_digit) in enumerate(
+                batch_samples
+            ):
+
+                predicted_digit = predictions[index].item()
+
+                if predicted_digit == correct_digit:
+                    continue
+
+                error_details.append(
+                    {
+                        "path": path,
+                        "correct_digit": correct_digit,
+                        "predicted_digit": predicted_digit,
+                        "confidence": (
+                            predicted_confidences[index].item()
+                            * 100
+                        )
+                    }
+                )
+
+    accuracy = (
+        100.0 * correct / total
+        if total > 0
+        else 0.0
+    )
+
+    del evaluation_model
+
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    return accuracy, confusion, error_details
+
+
+def build_user_test_report_section(
+    model_name,
+    model_file,
+    accuracy,
+    confusion,
+    error_details
+):
+
+    lines = [
+        "=" * 72,
+        f"Модель: {model_name}",
+        f"Файл: {model_file}",
+        f"Общая точность: {accuracy:.2f}%",
+        "",
+        "Точность по каждой цифре:"
+    ]
+
+    for digit in range(10):
+
+        total = confusion[digit].sum().item()
+        correct = confusion[digit, digit].item()
+
+        if total == 0:
+
+            lines.append(
+                f"  {digit}: нет тестовых примеров"
+            )
+
+        else:
+
+            class_accuracy = (
+                100.0 * correct / total
+            )
+
+            lines.append(
+                f"  {digit}: {class_accuracy:6.2f}% "
+                f"({correct}/{total})"
+            )
+
+    lines.extend(
+        [
+            "",
+            "Матрица ошибок:",
+            "Строка = правильная цифра, столбец = ответ модели.",
+            "",
+            "прав.\\ответ"
+            + "".join(
+                f"{digit:>6}"
+                for digit in range(10)
+            )
+        ]
+    )
+
+    for digit in range(10):
+
+        row = "".join(
+            f"{confusion[digit, predicted].item():>6}"
+            for predicted in range(10)
+        )
+
+        lines.append(
+            f"{digit:>11}{row}"
+        )
+
+    errors = []
+
+    for correct_digit in range(10):
+
+        for predicted_digit in range(10):
+
+            if correct_digit == predicted_digit:
+                continue
+
+            count = confusion[
+                correct_digit,
+                predicted_digit
+            ].item()
+
+            if count > 0:
+                errors.append(
+                    (
+                        count,
+                        correct_digit,
+                        predicted_digit
+                    )
+                )
+
+    errors.sort(reverse=True)
+
+    lines.extend(
+        [
+            "",
+            "Самые частые ошибки:"
+        ]
+    )
+
+    if not errors:
+
+        lines.append(
+            "  Ошибок нет."
+        )
+
+    else:
+
+        for count, correct_digit, predicted_digit in errors[:10]:
+
+            lines.append(
+                f"  цифра {correct_digit} распознана как "
+                f"{predicted_digit}: {count} раз"
+            )
+
+    lines.extend(
+        [
+            "",
+            "Подробности по каждому ошибочному изображению:"
+        ]
+    )
+
+    if not error_details:
+
+        lines.append(
+            "  Ошибочных изображений нет."
+        )
+
+    else:
+
+        sorted_details = sorted(
+            error_details,
+            key=lambda item: item["confidence"],
+            reverse=True
+        )
+
+        for number, error in enumerate(
+            sorted_details,
+            start=1
+        ):
+
+            lines.append(
+                f"  {number}. Правильная цифра: "
+                f"{error['correct_digit']} | "
+                f"Ответ модели: {error['predicted_digit']} | "
+                f"Уверенность: {error['confidence']:.2f}%"
+            )
+
+            lines.append(
+                f"     Файл: {error['path']}"
+            )
+
+    return lines
+
+
+def get_gallery_font(size):
+
+    font_candidates = [
+        "arial.ttf",
+        "DejaVuSans.ttf"
+    ]
+
+    for font_name in font_candidates:
+
+        try:
+            return ImageFont.truetype(
+                font_name,
+                size
+            )
+
+        except OSError:
+            continue
+
+    return ImageFont.load_default()
+
+
+def create_error_gallery(all_error_details):
+
+    columns = 3
+    card_width = 290
+    card_height = 180
+    margin = 20
+    header_height = 65
+
+    item_count = max(
+        1,
+        len(all_error_details)
+    )
+
+    rows = (
+        item_count + columns - 1
+    ) // columns
+
+    gallery_width = (
+        margin * 2
+        + columns * card_width
+    )
+
+    gallery_height = (
+        header_height
+        + margin
+        + rows * card_height
+        + margin
+    )
+
+    gallery = Image.new(
+        "RGB",
+        (
+            gallery_width,
+            gallery_height
+        ),
+        "#f2f2f2"
+    )
+
+    gallery_draw = ImageDraw.Draw(gallery)
+
+    title_font = get_gallery_font(24)
+    text_font = get_gallery_font(16)
+    small_font = get_gallery_font(13)
+
+    gallery_draw.text(
+        (margin, 18),
+        "CNN handwriting error analysis",
+        fill="black",
+        font=title_font
+    )
+
+    if not all_error_details:
+
+        gallery_draw.text(
+            (
+                margin,
+                header_height + 35
+            ),
+            "No errors: every test image was classified correctly.",
+            fill="#176b2c",
+            font=text_font
+        )
+
+        gallery.save(
+            TEST_ERRORS_IMAGE_FILE
+        )
+
+        return 0
+
+    for index, error in enumerate(
+        all_error_details
+    ):
+
+        row = index // columns
+        column = index % columns
+
+        x = margin + column * card_width
+        y = header_height + margin + row * card_height
+
+        gallery_draw.rounded_rectangle(
+            (
+                x,
+                y,
+                x + card_width - 12,
+                y + card_height - 12
+            ),
+            radius=10,
+            fill="white",
+            outline="#bbbbbb",
+            width=2
+        )
+
+        with Image.open(
+            error["path"]
+        ) as opened:
+
+            digit_image = (
+                opened
+                .convert("RGB")
+                .resize(
+                    (112, 112),
+                    Image.Resampling.NEAREST
+                )
+            )
+
+        gallery.paste(
+            digit_image,
+            (
+                x + 12,
+                y + 18
+            )
+        )
+
+        model_label = (
+            "Base CNN"
+            if error["model_name"] == "Базовая CNN"
+            else "User CNN"
+        )
+
+        text_x = x + 137
+
+        gallery_draw.text(
+            (text_x, y + 18),
+            model_label,
+            fill="#1f4e79",
+            font=text_font
+        )
+
+        gallery_draw.text(
+            (text_x, y + 52),
+            f"True: {error['correct_digit']}",
+            fill="black",
+            font=text_font
+        )
+
+        gallery_draw.text(
+            (text_x, y + 78),
+            f"Predicted: {error['predicted_digit']}",
+            fill="#a80000",
+            font=text_font
+        )
+
+        gallery_draw.text(
+            (text_x, y + 104),
+            f"Confidence: {error['confidence']:.2f}%",
+            fill="black",
+            font=small_font
+        )
+
+        filename = os.path.basename(
+            error["path"]
+        )
+
+        gallery_draw.text(
+            (x + 12, y + 140),
+            filename,
+            fill="#555555",
+            font=small_font
+        )
+
+    gallery.save(
+        TEST_ERRORS_IMAGE_FILE
+    )
+
+    return len(all_error_details)
+
+
+def open_errors_image():
+
+    if not os.path.exists(
+        TEST_ERRORS_IMAGE_FILE
+    ):
+
+        test_status.config(
+            text=(
+                "Изображение ошибок ещё не создано. "
+                "Сначала запустите проверку моделей."
+            )
+        )
+
+        return
+
+    image_path = os.path.abspath(
+        TEST_ERRORS_IMAGE_FILE
+    )
+
+    try:
+
+        if hasattr(os, "startfile"):
+            os.startfile(image_path)
+        else:
+            messagebox.showinfo(
+                "Изображение ошибок",
+                image_path
+            )
+
+    except Exception as error:
+
+        test_status.config(
+            text=(
+                "Не удалось открыть изображение ошибок: "
+                f"{error}"
+            )
+        )
+
+
+def evaluate_user_test_dataset():
+
+    samples = load_user_test_samples()
+
+    if not samples:
+
+        test_status.config(
+            text=(
+                "Тестовый набор пуст. Сначала сохраните "
+                "несколько рисунков."
+            )
+        )
+
+        return
+
+    counts = get_test_sample_counts()
+    missing_digits = [
+        str(digit)
+        for digit in range(10)
+        if counts[digit] == 0
+    ]
+
+    if missing_digits:
+
+        answer = messagebox.askyesno(
+            "Неполный тестовый набор",
+            (
+                "Нет примеров для цифр: "
+                + ", ".join(missing_digits)
+                + ".\n\nЗапустить неполную проверку?"
+            )
+        )
+
+        if not answer:
+            return
+
+    set_training_controls(False)
+
+    test_status.config(
+        text=(
+            f"Проверяю модели на {len(samples)} "
+            "рисунках вашего почерка..."
+        )
+    )
+
+    root.update_idletasks()
+
+    try:
+
+        models_to_test = [
+            (
+                "Базовая CNN",
+                BASE_MODEL_FILE
+            )
+        ]
+
+        if os.path.exists(USER_MODEL_FILE):
+
+            models_to_test.append(
+                (
+                    "CNN после пользовательских исправлений",
+                    USER_MODEL_FILE
+                )
+            )
+
+        report = [
+            "ОЦЕНКА CNN НА ПОЧЕРКЕ ПОЛЬЗОВАТЕЛЯ",
+            f"Количество изображений: {len(samples)}",
+            f"Устройство: {device}",
+            "",
+            (
+                "Важно: эти изображения не использовались "
+                "для обучения модели."
+            ),
+            ""
+        ]
+
+        results = []
+        all_error_details = []
+
+        for model_name, model_file in models_to_test:
+
+            accuracy, confusion, error_details = (
+                evaluate_model_on_user_samples(
+                    model_file,
+                    samples
+                )
+            )
+
+            for error in error_details:
+
+                gallery_error = error.copy()
+                gallery_error["model_name"] = model_name
+
+                all_error_details.append(
+                    gallery_error
+                )
+
+            results.append(
+                (
+                    model_name,
+                    accuracy
+                )
+            )
+
+            report.extend(
+                build_user_test_report_section(
+                    model_name,
+                    model_file,
+                    accuracy,
+                    confusion,
+                    error_details
+                )
+            )
+
+            report.append("")
+
+        if len(results) == 2:
+
+            difference = (
+                results[1][1]
+                - results[0][1]
+            )
+
+            report.extend(
+                [
+                    "=" * 72,
+                    "СРАВНЕНИЕ МОДЕЛЕЙ",
+                    f"Базовая CNN: {results[0][1]:.2f}%",
+                    (
+                        "CNN после исправлений: "
+                        f"{results[1][1]:.2f}%"
+                    ),
+                    (
+                        "Изменение: "
+                        f"{difference:+.2f} процентного пункта"
+                    )
+                ]
+            )
+
+        report_text = "\n".join(report)
+
+        with open(
+            TEST_REPORT_FILE,
+            "w",
+            encoding="utf-8"
+        ) as report_file:
+
+            report_file.write(report_text)
+
+        gallery_error_count = create_error_gallery(
+            all_error_details
+        )
+
+        summary = " | ".join(
+            f"{name}: {accuracy:.2f}%"
+            for name, accuracy in results
+        )
+
+        test_status.config(
+            text=(
+                f"✓ Проверка завершена. {summary}. "
+                f"Отчёт: {TEST_REPORT_FILE}. "
+                f"Ошибок на изображении: {gallery_error_count}."
+            )
+        )
+
+        print()
+        print(report_text)
+        print()
+        print(
+            "Отчёт сохранён:",
+            os.path.abspath(TEST_REPORT_FILE)
+        )
+
+        print(
+            "Изображение ошибок сохранено:",
+            os.path.abspath(TEST_ERRORS_IMAGE_FILE)
+        )
+
+    except Exception as error:
+
+        test_status.config(
+            text=(
+                "Ошибка проверки тестового набора: "
+                f"{error}"
+            )
+        )
+
+        print(
+            "Ошибка проверки тестового набора:",
+            error
+        )
+
+    finally:
+
+        set_training_controls(True)
+
+
+# ============================================================
+# 18. ОЧИСТКА ПОЛЯ
 # ============================================================
 
 def clear():
@@ -1402,9 +2274,13 @@ def clear():
         text=""
     )
 
+    test_status.config(
+        text=""
+    )
+
 
 # ============================================================
-# 18. ИНТЕРФЕЙС
+# 19. ИНТЕРФЕЙС
 # ============================================================
 
 title_label = tk.Label(
@@ -1449,15 +2325,121 @@ left_frame.pack(
 )
 
 
-right_frame = tk.Frame(
+# Правая часть содержит много элементов. Помещаем её в прокручиваемую
+# область, чтобы нижний тестовый раздел был доступен на любом экране.
+right_container = tk.Frame(
     main_frame
 )
 
-right_frame.pack(
+right_container.pack(
     side=tk.RIGHT,
     fill=tk.BOTH,
     expand=True,
     padx=15
+)
+
+
+right_scrollbar = tk.Scrollbar(
+    right_container,
+    orient=tk.VERTICAL
+)
+
+right_scrollbar.pack(
+    side=tk.RIGHT,
+    fill=tk.Y
+)
+
+
+right_scroll_canvas = tk.Canvas(
+    right_container,
+    highlightthickness=0,
+    borderwidth=0,
+    bg=root.cget("bg"),
+    yscrollcommand=right_scrollbar.set
+)
+
+right_scroll_canvas.pack(
+    side=tk.LEFT,
+    fill=tk.BOTH,
+    expand=True
+)
+
+right_scrollbar.config(
+    command=right_scroll_canvas.yview
+)
+
+
+right_frame = tk.Frame(
+    right_scroll_canvas,
+    bg=root.cget("bg")
+)
+
+right_window = right_scroll_canvas.create_window(
+    (0, 0),
+    window=right_frame,
+    anchor="nw"
+)
+
+
+def update_right_scroll_region(event=None):
+
+    right_scroll_canvas.configure(
+        scrollregion=right_scroll_canvas.bbox("all")
+    )
+
+
+def fit_right_panel_width(event):
+
+    right_scroll_canvas.itemconfigure(
+        right_window,
+        width=event.width
+    )
+
+
+def scroll_right_panel(event):
+
+    if event.delta == 0:
+        return
+
+    right_scroll_canvas.yview_scroll(
+        int(-event.delta / 120),
+        "units"
+    )
+
+
+def enable_right_mousewheel(event):
+
+    root.bind_all(
+        "<MouseWheel>",
+        scroll_right_panel
+    )
+
+
+def disable_right_mousewheel(event):
+
+    root.unbind_all(
+        "<MouseWheel>"
+    )
+
+
+right_frame.bind(
+    "<Configure>",
+    update_right_scroll_region
+)
+
+right_scroll_canvas.bind(
+    "<Configure>",
+    fit_right_panel_width
+)
+
+right_scroll_canvas.bind(
+    "<Enter>",
+    enable_right_mousewheel
+)
+
+right_scroll_canvas.bind(
+    "<Leave>",
+    disable_right_mousewheel
 )
 
 
@@ -1770,7 +2752,190 @@ correction_status = tk.Label(
 correction_status.pack(
     pady=(
         8,
+        6
+    )
+)
+
+
+test_separator = tk.Frame(
+    right_frame,
+    height=2,
+    bg="lightgray"
+)
+
+test_separator.pack(
+    fill=tk.X,
+    pady=6
+)
+
+
+test_title = tk.Label(
+    right_frame,
+    text="Честный тест на вашем почерке",
+    font=(
+        "Arial",
+        14,
+        "bold"
+    )
+)
+
+test_title.pack(
+    pady=(
+        4,
+        3
+    )
+)
+
+
+test_instruction = tk.Label(
+    right_frame,
+    text=(
+        "Укажите, какую цифру нарисовали, и сохраните её только "
+        "для теста. Не дообучайте модель на этих же рисунках."
+    ),
+    font=(
+        "Arial",
         10
+    ),
+    wraplength=540,
+    justify=tk.CENTER
+)
+
+test_instruction.pack(
+    pady=3
+)
+
+
+test_input_frame = tk.Frame(
+    right_frame
+)
+
+test_input_frame.pack(
+    pady=5
+)
+
+
+test_digit_label = tk.Label(
+    test_input_frame,
+    text="Нарисованная цифра:",
+    font=(
+        "Arial",
+        11
+    )
+)
+
+test_digit_label.pack(
+    side=tk.LEFT,
+    padx=4
+)
+
+
+test_digit_var = tk.StringVar(
+    value="0"
+)
+
+
+test_digit_entry = tk.Spinbox(
+    test_input_frame,
+    from_=0,
+    to=9,
+    textvariable=test_digit_var,
+    width=3,
+    justify="center",
+    font=(
+        "Arial",
+        13
+    )
+)
+
+test_digit_entry.pack(
+    side=tk.LEFT,
+    padx=4
+)
+
+
+save_test_button = tk.Button(
+    test_input_frame,
+    text="Сохранить в тестовый набор",
+    command=save_test_sample,
+    font=(
+        "Arial",
+        10,
+        "bold"
+    ),
+    width=24
+)
+
+save_test_button.pack(
+    side=tk.LEFT,
+    padx=6
+)
+
+
+evaluate_test_button = tk.Button(
+    right_frame,
+    text="Проверить модели на моём почерке",
+    command=evaluate_user_test_dataset,
+    font=(
+        "Arial",
+        10,
+        "bold"
+    ),
+    width=34
+)
+
+evaluate_test_button.pack(
+    pady=4
+)
+
+
+open_errors_button = tk.Button(
+    right_frame,
+    text="Открыть изображение ошибок",
+    command=open_errors_image,
+    font=(
+        "Arial",
+        10
+    ),
+    width=30
+)
+
+open_errors_button.pack(
+    pady=3
+)
+
+
+test_counts_label = tk.Label(
+    right_frame,
+    text="",
+    font=(
+        "Consolas",
+        9
+    ),
+    wraplength=540,
+    justify=tk.CENTER
+)
+
+test_counts_label.pack(
+    pady=3
+)
+
+
+test_status = tk.Label(
+    right_frame,
+    text="",
+    font=(
+        "Arial",
+        9
+    ),
+    wraplength=540,
+    justify=tk.CENTER
+)
+
+test_status.pack(
+    pady=(
+        2,
+        5
     )
 )
 
@@ -1793,7 +2958,7 @@ model_info_label.pack(
 
 
 # ============================================================
-# 19. СОБЫТИЯ
+# 20. СОБЫТИЯ
 # ============================================================
 
 canvas.bind(
@@ -1840,9 +3005,10 @@ root.bind(
 
 
 # ============================================================
-# 20. ЗАПУСК
+# 21. ЗАПУСК
 # ============================================================
 
 update_model_info()
+update_test_info()
 
 root.mainloop()
