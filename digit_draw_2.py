@@ -1,3 +1,4 @@
+import json
 import os
 import tkinter as tk
 from tkinter import messagebox
@@ -16,11 +17,14 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 BASE_MODEL_FILE = "mnist_cnn_model.pth"
 USER_MODEL_FILE = "mnist_cnn_user.pth"
+UNKNOWN_DETECTOR_FILE = "unknown_detector.pth"
+UNKNOWN_CONFIG_FILE = "unknown_detector_config.json"
 
 BRUSH_SIZE = 7
 DEFAULT_SPLIT_GAP = 1
 MIN_FOREGROUND_PIXELS = 3
 MAX_DIGITS = 30
+MIN_CNN_CONFIDENCE_PERCENT = 50.0
 
 
 # ============================================================
@@ -54,6 +58,37 @@ class CNN(nn.Module):
         return self.classifier(self.features(x))
 
 
+class UnknownDetector(nn.Module):
+    """Отдельная CNN: цифра (1) или неизвестный символ (0)."""
+
+    def __init__(self):
+        super().__init__()
+
+        self.features = nn.Sequential(
+            nn.Conv2d(1, 24, kernel_size=3, padding=1),
+            nn.BatchNorm2d(24),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+            nn.Conv2d(24, 48, kernel_size=3, padding=1),
+            nn.BatchNorm2d(48),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+            nn.Conv2d(48, 64, kernel_size=3, padding=1),
+            nn.ReLU(),
+        )
+
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(64 * 7 * 7, 96),
+            nn.ReLU(),
+            nn.Dropout(0.20),
+            nn.Linear(96, 1),
+        )
+
+    def forward(self, x):
+        return self.classifier(self.features(x)).squeeze(1)
+
+
 def load_model():
 
     if os.path.exists(USER_MODEL_FILE):
@@ -83,12 +118,50 @@ def load_model():
     return loaded_model, model_file
 
 
+def load_unknown_detector():
+
+    if not os.path.exists(UNKNOWN_DETECTOR_FILE):
+        raise FileNotFoundError(
+            f"Не найден {UNKNOWN_DETECTOR_FILE}.\n"
+            "Сначала запустите train_unknown_detector.py."
+        )
+
+    if not os.path.exists(UNKNOWN_CONFIG_FILE):
+        raise FileNotFoundError(
+            f"Не найден {UNKNOWN_CONFIG_FILE}.\n"
+            "Сначала запустите train_unknown_detector.py."
+        )
+
+    with open(UNKNOWN_CONFIG_FILE, "r", encoding="utf-8") as config_file:
+        config = json.load(config_file)
+
+    threshold = float(config.get("digit_probability_threshold", 0.50))
+    threshold = max(0.01, min(threshold, 0.99))
+
+    detector = UnknownDetector().to(device)
+    detector_state = torch.load(
+        UNKNOWN_DETECTOR_FILE,
+        map_location=device,
+        weights_only=True
+    )
+    detector.load_state_dict(detector_state)
+    detector.eval()
+
+    for parameter in detector.parameters():
+        parameter.requires_grad_(False)
+
+    return detector, threshold
+
+
 model, current_model_file = load_model()
+unknown_detector, unknown_threshold = load_unknown_detector()
 
 print("Устройство:", device)
 if torch.cuda.is_available():
     print("GPU:", torch.cuda.get_device_name(0))
 print("Модель:", current_model_file)
+print("Детектор неизвестных символов:", UNKNOWN_DETECTOR_FILE)
+print(f"Порог 'это цифра': {unknown_threshold:.6f}")
 print("Режим: только распознавание, веса модели не изменяются")
 
 
@@ -97,7 +170,7 @@ print("Режим: только распознавание, веса модел�
 # ============================================================
 
 root = tk.Tk()
-root.title("Распознавание последовательности цифр — CNN")
+root.title("Распознавание цифр и неизвестных символов — CNN")
 root.state("zoomed")
 root.resizable(True, True)
 root.update_idletasks()
@@ -422,29 +495,47 @@ def save_diagnostic_strip(images):
     strip.save("last_sequence_input.png")
 
 
-def show_boxes(boxes):
+def show_boxes(boxes, fragment_results=None):
 
     canvas.delete("segment_box")
 
     for index, (x1, y1, x2, y2) in enumerate(boxes, start=1):
+
+        fragment_result = None
+
+        if fragment_results is not None and index - 1 < len(fragment_results):
+            fragment_result = fragment_results[index - 1]
+
+        is_unknown = bool(
+            fragment_result is not None
+            and fragment_result["is_unknown"]
+        )
+        color = "#ff2d2d" if is_unknown else "#00d8ff"
+        marker = (
+            "?"
+            if is_unknown
+            else str(fragment_result["digit"])
+            if fragment_result is not None
+            else str(index)
+        )
 
         canvas.create_rectangle(
             x1,
             y1,
             x2,
             y2,
-            outline="#00d8ff",
-            width=2,
+            outline=color,
+            width=4 if is_unknown else 2,
             tags="segment_box"
         )
 
         canvas.create_text(
             x1 + 4,
             max(12, y1 - 12),
-            text=str(index),
-            fill="#00d8ff",
+            text=marker,
+            fill=color,
             anchor="w",
-            font=("Arial", 11, "bold"),
+            font=("Arial", 14 if is_unknown else 11, "bold"),
             tags="segment_box"
         )
 
@@ -462,8 +553,6 @@ def recognize_sequence(event=None):
         details_label.config(text="")
         status_label.config(text="Сначала нарисуйте одну или несколько цифр.")
         return
-
-    show_boxes(boxes)
 
     digit_images = []
     valid_boxes = []
@@ -487,15 +576,56 @@ def recognize_sequence(event=None):
         logits = model(batch)
         probabilities = torch.softmax(logits, dim=1)
         predictions = probabilities.argmax(dim=1)
+        digit_probabilities = torch.sigmoid(unknown_detector(batch))
 
     predicted_digits = predictions.tolist()
-    sequence = "".join(str(digit) for digit in predicted_digits)
-
+    sequence_parts = []
     details = []
+    fragment_results = []
 
     for index, digit in enumerate(predicted_digits):
         confidence = probabilities[index, digit].item() * 100
-        details.append(f"{index + 1}: {digit} ({confidence:.2f}%)")
+        digit_probability = digit_probabilities[index].item()
+        detector_rejected = digit_probability < unknown_threshold
+        low_cnn_confidence = confidence < MIN_CNN_CONFIDENCE_PERCENT
+        is_unknown = detector_rejected or low_cnn_confidence
+
+        fragment_results.append(
+            {
+                "is_unknown": is_unknown,
+                "digit": digit,
+                "confidence": confidence,
+                "digit_probability": digit_probability * 100,
+                "detector_rejected": detector_rejected,
+                "low_cnn_confidence": low_cnn_confidence,
+            }
+        )
+
+        if is_unknown:
+            reasons = []
+
+            if detector_rejected:
+                reasons.append(
+                    f"детектор цифры {digit_probability * 100:.2f}%"
+                )
+
+            if low_cnn_confidence:
+                reasons.append(f"уверенность CNN {confidence:.2f}% < 50%")
+
+            sequence_parts.append("?")
+            details.append(
+                f"{index + 1}: неизвестный "
+                f"({'; '.join(reasons)}; предположение {digit} отклонено)"
+            )
+        else:
+            sequence_parts.append(str(digit))
+            details.append(
+                f"{index + 1}: {digit} ({confidence:.2f}%; "
+                f"цифра {digit_probability * 100:.2f}%)"
+            )
+
+    sequence = "".join(sequence_parts)
+    show_boxes(valid_boxes, fragment_results)
 
     save_diagnostic_strip(digit_images)
 
@@ -512,9 +642,19 @@ def recognize_sequence(event=None):
             wide_fragments += 1
 
     messages = [
-        f"Найдено цифр: {len(digit_images)}.",
-        "Голубые рамки показывают, как программа разделила запись."
+        f"Найдено фрагментов: {len(digit_images)}.",
+        "Голубая рамка — цифра; красная рамка и ? — неизвестный символ."
     ]
+
+    unknown_count = sum(
+        1 for result in fragment_results
+        if result["is_unknown"]
+    )
+
+    if unknown_count:
+        messages.append(
+            f"Неизвестных символов: {unknown_count}; они не были угаданы как цифры."
+        )
 
     if wide_fragments:
         messages.append(
@@ -533,7 +673,7 @@ def recognize_sequence(event=None):
 
 title_label = tk.Label(
     root,
-    text="Распознавание последовательности цифр",
+    text="Распознавание цифр без угадывания неизвестных символов",
     font=("Arial", 20, "bold")
 )
 title_label.pack(pady=(16, 4))
@@ -542,7 +682,7 @@ instruction_label = tk.Label(
     root,
     text=(
         "Пишите слева направо. Между цифрами оставляйте 25–30 пикселей; "
-        "цифры не должны касаться."
+        "символы не должны касаться. Неизвестные символы выделяются красным."
     ),
     font=("Arial", 14)
 )
@@ -637,6 +777,8 @@ model_info_label = tk.Label(
     root,
     text=(
         f"Модель: {current_model_file}   |   Устройство: {device}   |   "
+        f"Порог цифры: {unknown_threshold:.2%}   |   "
+        f"Минимум CNN: {MIN_CNN_CONFIDENCE_PERCENT:.0f}%   |   "
         "Веса зафиксированы"
     ),
     font=("Arial", 10),

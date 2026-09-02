@@ -1,0 +1,12 @@
+{
+  "format_version": 1,
+  "model_type": "binary_digit_unknown_detector",
+  "digit_probability_threshold": 0.07433164864778519,
+  "target_digit_recall": 0.995,
+  "validation_digit_recall": 0.9950000047683716,
+  "validation_unknown_recall": 0.9733999967575073,
+  "best_epoch": 4,
+  "custom_unknown_examples": 0,
+  "emnist_used": false,
+  "created_utc": "2026-09-02T10:49:43.421254+00:00"
+}
