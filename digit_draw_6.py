@@ -1,4 +1,3 @@
-import json
 import os
 import tkinter as tk
 from tkinter import messagebox
@@ -17,14 +16,12 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 BASE_MODEL_FILE = "mnist_cnn_model.pth"
 USER_MODEL_FILE = "mnist_cnn_user.pth"
-UNKNOWN_DETECTOR_FILE = "unknown_detector.pth"
-UNKNOWN_CONFIG_FILE = "unknown_detector_config.json"
 
 BRUSH_SIZE = 7
 DEFAULT_SPLIT_GAP = 1
 MIN_FOREGROUND_PIXELS = 3
 MAX_DIGITS = 30
-MIN_CNN_CONFIDENCE_PERCENT = 30.0
+MIN_CNN_CONFIDENCE_PERCENT = 50.0
 
 
 # ============================================================
@@ -58,37 +55,6 @@ class CNN(nn.Module):
         return self.classifier(self.features(x))
 
 
-class UnknownDetector(nn.Module):
-    """Отдельная CNN: цифра (1) или неизвестный символ (0)."""
-
-    def __init__(self):
-        super().__init__()
-
-        self.features = nn.Sequential(
-            nn.Conv2d(1, 24, kernel_size=3, padding=1),
-            nn.BatchNorm2d(24),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
-            nn.Conv2d(24, 48, kernel_size=3, padding=1),
-            nn.BatchNorm2d(48),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
-            nn.Conv2d(48, 64, kernel_size=3, padding=1),
-            nn.ReLU(),
-        )
-
-        self.classifier = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(64 * 7 * 7, 96),
-            nn.ReLU(),
-            nn.Dropout(0.20),
-            nn.Linear(96, 1),
-        )
-
-    def forward(self, x):
-        return self.classifier(self.features(x)).squeeze(1)
-
-
 def load_model():
 
     if os.path.exists(USER_MODEL_FILE):
@@ -118,50 +84,12 @@ def load_model():
     return loaded_model, model_file
 
 
-def load_unknown_detector():
-
-    if not os.path.exists(UNKNOWN_DETECTOR_FILE):
-        raise FileNotFoundError(
-            f"Не найден {UNKNOWN_DETECTOR_FILE}.\n"
-            "Сначала запустите train_unknown_detector.py."
-        )
-
-    if not os.path.exists(UNKNOWN_CONFIG_FILE):
-        raise FileNotFoundError(
-            f"Не найден {UNKNOWN_CONFIG_FILE}.\n"
-            "Сначала запустите train_unknown_detector.py."
-        )
-
-    with open(UNKNOWN_CONFIG_FILE, "r", encoding="utf-8") as config_file:
-        config = json.load(config_file)
-
-    threshold = float(config.get("digit_probability_threshold", 0.50))
-    threshold = max(0.01, min(threshold, 0.99))
-
-    detector = UnknownDetector().to(device)
-    detector_state = torch.load(
-        UNKNOWN_DETECTOR_FILE,
-        map_location=device,
-        weights_only=True
-    )
-    detector.load_state_dict(detector_state)
-    detector.eval()
-
-    for parameter in detector.parameters():
-        parameter.requires_grad_(False)
-
-    return detector, threshold
-
-
 model, current_model_file = load_model()
-unknown_detector, unknown_threshold = load_unknown_detector()
 
 print("Устройство:", device)
 if torch.cuda.is_available():
     print("GPU:", torch.cuda.get_device_name(0))
 print("Модель:", current_model_file)
-print("Детектор неизвестных символов:", UNKNOWN_DETECTOR_FILE)
-print(f"Порог 'это цифра': {unknown_threshold:.6f}")
 print("Режим: только распознавание, веса модели не изменяются")
 
 
@@ -170,7 +98,7 @@ print("Режим: только распознавание, веса модел�
 # ============================================================
 
 root = tk.Tk()
-root.title("Распознавание цифр и неизвестных символов — CNN")
+root.title("Распознавание последовательности цифр — CNN")
 root.state("zoomed")
 root.resizable(True, True)
 root.update_idletasks()
@@ -495,29 +423,41 @@ def save_diagnostic_strip(images):
     strip.save("last_sequence_input.png")
 
 
-def show_boxes(boxes, fragment_results=None):
+def show_boxes(boxes, results=None):
+    """
+    Показывает рамку вокруг каждой выделенной цифры.
+
+    Над рамкой отображается цифра и процент уверенности CNN.
+    При уверенности ниже 50% рамка красная, а символ считается неизвестным.
+    """
 
     canvas.delete("segment_box")
 
-    for index, (x1, y1, x2, y2) in enumerate(boxes, start=1):
+    for index, (x1, y1, x2, y2) in enumerate(boxes):
 
-        fragment_result = None
+        result = None
+        if results is not None and index < len(results):
+            result = results[index]
 
-        if fragment_results is not None and index - 1 < len(fragment_results):
-            fragment_result = fragment_results[index - 1]
+        if result is None:
+            color = "#00d8ff"
+            marker = str(index + 1)
+            confidence_text = ""
+            is_unknown = False
+        else:
+            confidence = result["confidence"]
+            is_unknown = confidence < MIN_CNN_CONFIDENCE_PERCENT
 
-        is_unknown = bool(
-            fragment_result is not None
-            and fragment_result["is_unknown"]
-        )
-        color = "#ff2d2d" if is_unknown else "#00d8ff"
-        marker = (
-            "?"
-            if is_unknown
-            else str(fragment_result["digit"])
-            if fragment_result is not None
-            else str(index)
-        )
+            if is_unknown:
+                color = "#ff2d2d"
+                marker = "?"
+            else:
+                color = "#00d8ff"
+                marker = str(result["digit"])
+
+            confidence_text = f"{confidence:.2f}%"
+
+        label_text = marker
 
         canvas.create_rectangle(
             x1,
@@ -529,13 +469,14 @@ def show_boxes(boxes, fragment_results=None):
             tags="segment_box"
         )
 
+        # Значение распознавания и уверенность — сверху рамки.
         canvas.create_text(
-            x1 + 4,
-            max(12, y1 - 12),
-            text=marker,
+            (x1 + x2) // 2,
+            max(12, y1 - 8),
+            text=label_text,
             fill=color,
-            anchor="w",
-            font=("Arial", 14 if is_unknown else 11, "bold"),
+            anchor="s",
+            font=("Arial", 13, "bold"),
             tags="segment_box"
         )
 
@@ -551,7 +492,9 @@ def recognize_sequence(event=None):
     if not boxes:
         result_label.config(text="Рисунок не найден")
         details_label.config(text="")
-        status_label.config(text="Сначала нарисуйте одну или несколько цифр.")
+        status_label.config(
+            text="Сначала нарисуйте одну или несколько цифр."
+        )
         return
 
     digit_images = []
@@ -566,6 +509,7 @@ def recognize_sequence(event=None):
 
     if not digit_images:
         result_label.config(text="Не удалось выделить цифры")
+        details_label.config(text="")
         return
 
     batch = torch.stack(
@@ -576,93 +520,70 @@ def recognize_sequence(event=None):
         logits = model(batch)
         probabilities = torch.softmax(logits, dim=1)
         predictions = probabilities.argmax(dim=1)
-        digit_probabilities = torch.sigmoid(unknown_detector(batch))
 
     predicted_digits = predictions.tolist()
-    sequence_parts = []
-    details = []
-    fragment_results = []
+    results = []
 
     for index, digit in enumerate(predicted_digits):
         confidence = probabilities[index, digit].item() * 100
-        digit_probability = digit_probabilities[index].item()
-        detector_rejected = digit_probability < unknown_threshold
-        low_cnn_confidence = confidence < MIN_CNN_CONFIDENCE_PERCENT
-        is_unknown = detector_rejected or low_cnn_confidence
 
-        fragment_results.append(
+        results.append(
             {
-                "is_unknown": is_unknown,
                 "digit": digit,
                 "confidence": confidence,
-                "digit_probability": digit_probability * 100,
-                "detector_rejected": detector_rejected,
-                "low_cnn_confidence": low_cnn_confidence,
+                "is_unknown": confidence < MIN_CNN_CONFIDENCE_PERCENT,
             }
         )
 
-        if is_unknown:
-            reasons = []
+    # Показываем цифру и уверенность непосредственно сверху рамки.
+    show_boxes(valid_boxes, results)
 
-            if detector_rejected:
-                reasons.append(
-                    f"детектор цифры {digit_probability * 100:.2f}%"
-                )
+    sequence_parts = []
+    details = []
 
-            if low_cnn_confidence:
-                reasons.append(f"уверенность CNN {confidence:.2f}% < 50%")
+    for index, result in enumerate(results):
+        digit = result["digit"]
+        confidence = result["confidence"]
 
+        if result["is_unknown"]:
             sequence_parts.append("?")
             details.append(
                 f"{index + 1}: неизвестный "
-                f"({'; '.join(reasons)}; предположение {digit} отклонено)"
+                f"(предположение {digit}, "
+                f"уверенность {confidence:.2f}% < "
+                f"{MIN_CNN_CONFIDENCE_PERCENT:.0f}%)"
             )
         else:
             sequence_parts.append(str(digit))
             details.append(
-                f"{index + 1}: {digit} ({confidence:.2f}%; "
-                f"цифра {digit_probability * 100:.2f}%)"
+                f"{index + 1}: {digit} ({confidence:.2f}%)"
             )
 
     sequence = "".join(sequence_parts)
-    show_boxes(valid_boxes, fragment_results)
 
     save_diagnostic_strip(digit_images)
 
     result_label.config(text=f"Результат: {sequence}")
     details_label.config(text="   |   ".join(details))
 
-    wide_fragments = 0
-
-    for x1, y1, x2, y2 in valid_boxes:
-        width = x2 - x1
-        height = max(1, y2 - y1)
-
-        if width > height * 1.25:
-            wide_fragments += 1
-
-    messages = [
-        f"Найдено фрагментов: {len(digit_images)}.",
-        "Голубая рамка — цифра; красная рамка и ? — неизвестный символ."
-    ]
-
     unknown_count = sum(
-        1 for result in fragment_results
+        1 for result in results
         if result["is_unknown"]
     )
 
-    if unknown_count:
-        messages.append(
-            f"Неизвестных символов: {unknown_count}; они не были угаданы как цифры."
-        )
+    messages = [
+        f"Найдено фрагментов: {len(digit_images)}.",
+        f"Порог распознавания: {MIN_CNN_CONFIDENCE_PERCENT:.0f}%.",
+        "Красная рамка и ? означают уверенность ниже 50%."
+    ]
 
-    if wide_fragments:
-        messages.append(
-            "Есть широкий фрагмент: возможно, некоторые цифры соприкасаются."
-        )
+    if unknown_count:
+        messages.append(f"Неизвестных символов: {unknown_count}.")
 
     if was_truncated:
-        messages.append(f"Обработаны только первые {MAX_DIGITS} цифр.")
+        messages.append(
+            f"Обработаны только первые {MAX_DIGITS} цифр."
+        )
 
     status_label.config(text=" ".join(messages))
 
@@ -673,7 +594,7 @@ def recognize_sequence(event=None):
 
 title_label = tk.Label(
     root,
-    text="Распознавание цифр без угадывания неизвестных символов",
+    text="Распознавание последовательности цифр",
     font=("Arial", 20, "bold")
 )
 title_label.pack(pady=(16, 4))
@@ -682,7 +603,8 @@ instruction_label = tk.Label(
     root,
     text=(
         "Пишите слева направо. Между цифрами оставляйте 25–30 пикселей; "
-        "символы не должны касаться. Неизвестные символы выделяются красным."
+        "цифры не должны касаться. Над рамкой показываются цифра и уверенность. "
+        'При уверенности ниже 50% рамка красная, а результат — "?".'
     ),
     font=("Arial", 14)
 )
@@ -726,25 +648,9 @@ clear_button = tk.Button(
 )
 clear_button.pack(side=tk.LEFT, padx=8)
 
-# gap_label = tk.Label(
-#     controls_frame,
-#     text="Граница цифр, пикс.:",
-#     font=("Arial", 12)
-# )
-# gap_label.pack(side=tk.LEFT, padx=(22, 5))
 
 split_gap_var = tk.StringVar(value=str(DEFAULT_SPLIT_GAP))
 
-# split_gap_spinbox = tk.Spinbox(
-#     controls_frame,
-#     from_=3,
-#     to=80,
-#     textvariable=split_gap_var,
-#     width=5,
-#     justify="center",
-#     font=("Arial", 13)
-# )
-# split_gap_spinbox.pack(side=tk.LEFT)
 
 result_label = tk.Label(
     root,
@@ -777,8 +683,7 @@ model_info_label = tk.Label(
     root,
     text=(
         f"Модель: {current_model_file}   |   Устройство: {device}   |   "
-        f"Порог цифры: {unknown_threshold:.2%}   |   "
-        f"Минимум CNN: {MIN_CNN_CONFIDENCE_PERCENT:.0f}%   |   "
+        f"Минимальная уверенность: {MIN_CNN_CONFIDENCE_PERCENT:.0f}%   |   "
         "Веса зафиксированы"
     ),
     font=("Arial", 10),
